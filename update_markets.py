@@ -2,7 +2,7 @@ import time
 import pandas as pd
 from data_updater.trading_utils import get_clob_client
 from data_updater.google_utils import get_spreadsheet
-from data_updater.find_markets import get_sel_df, get_all_markets, get_all_results, get_markets, add_volatility_to_df
+from data_updater.find_markets import get_sel_df, get_all_markets, get_all_results, get_markets, add_volatility_to_df, process_single_row, filter_crypto_markets
 from gspread_dataframe import set_with_dataframe
 import traceback
 
@@ -12,6 +12,12 @@ client = get_clob_client()
 
 wk_all = spreadsheet.worksheet("All Markets")
 wk_vol = spreadsheet.worksheet("Volatility Markets")
+wk_crypto = None
+try:
+    wk_crypto = spreadsheet.worksheet("Crypto Markets")
+except:
+    # Worksheet doesn't exist yet, will be created later
+    pass
 
 sel_df = get_sel_df(spreadsheet, "Selected Markets")
 
@@ -75,7 +81,7 @@ def sort_df(df):
     return sorted_df
 
 def fetch_and_process_data():
-    global spreadsheet, client, wk_all, wk_vol, sel_df
+    global spreadsheet, client, wk_all, wk_vol, wk_crypto, sel_df
     
     spreadsheet = get_spreadsheet()
     client = get_clob_client()
@@ -83,19 +89,33 @@ def fetch_and_process_data():
     wk_all = spreadsheet.worksheet("All Markets")
     wk_vol = spreadsheet.worksheet("Volatility Markets")
     wk_full = spreadsheet.worksheet("Full Markets")
+    
+    # Create or get the Crypto Markets worksheet
+    try:
+        wk_crypto = spreadsheet.worksheet("Crypto Markets")
+    except:
+        # Create the worksheet if it doesn't exist
+        wk_crypto = spreadsheet.add_worksheet(title="Crypto Markets", rows=1000, cols=30)
+        print("Created new 'Crypto Markets' worksheet")
 
     sel_df = get_sel_df(spreadsheet, "Selected Markets")
 
-
     all_df = get_all_markets(client)
     print("Got all Markets")
-    all_results = get_all_results(all_df, client)
+    
+    # Filter crypto markets
+    crypto_df = filter_crypto_markets(all_df)
+    print(f"Found {len(crypto_df)} crypto markets")
+    
+    # Reduce the number of concurrent workers to avoid rate limiting
+    all_results = get_all_results(all_df, client, max_workers=3)
     print("Got all Results")
     m_data, all_markets = get_markets(all_results, sel_df, maker_reward=0.75)
     print("Got all orderbook")
 
     print(f'{pd.to_datetime("now")}: Fetched all markets data of length {len(all_markets)}.')
-    new_df = add_volatility_to_df(all_markets)
+    # Reduce the number of concurrent workers for volatility data to avoid rate limiting
+    new_df = add_volatility_to_df(all_markets, max_workers=2)
     new_df['volatility_sum'] =  new_df['24_hour'] + new_df['7_day'] + new_df['14_day']
     
     new_df = new_df.sort_values('volatility_sum', ascending=True)
@@ -113,6 +133,54 @@ def fetch_and_process_data():
    
     new_df = new_df.sort_values('gm_reward_per_100', ascending=False)
     
+    # Process crypto markets if any were found
+    if len(crypto_df) > 0:
+        # Get results for crypto markets
+        crypto_results = []
+        crypto_error_log = []
+        
+        for idx, row in crypto_df.iterrows():
+            try:
+                result = process_single_row(row, client)
+                if result:
+                    crypto_results.append(result)
+            except Exception as e:
+                error_info = {
+                    'index': idx,
+                    'question': row.get('question', 'Unknown'),
+                    'market_slug': row.get('market_slug', 'Unknown'),
+                    'error': str(e)
+                }
+                crypto_error_log.append(error_info)
+                print(f"Error processing crypto market: {error_info['question']} - {error_info['error']}")
+        
+        # Save crypto market errors to file
+        if crypto_error_log:
+            crypto_error_df = pd.DataFrame(crypto_error_log)
+            crypto_error_df.to_csv('crypto_market_errors.csv', index=False)
+            print(f"Saved {len(crypto_error_log)} crypto market errors to crypto_market_errors.csv")
+        
+        if crypto_results:
+            crypto_markets_df = pd.DataFrame(crypto_results)
+            crypto_markets_df['spread'] = abs(crypto_markets_df['best_ask'] - crypto_markets_df['best_bid'])
+            
+            # Add volatility data with reduced workers to avoid rate limiting
+            crypto_markets_df = add_volatility_to_df(crypto_markets_df, max_workers=2)
+            crypto_markets_df['volatility_sum'] = crypto_markets_df['24_hour'] + crypto_markets_df['7_day'] + crypto_markets_df['14_day']
+            
+            crypto_markets_df = crypto_markets_df.sort_values('gm_reward_per_100', ascending=False)
+            crypto_markets_df['volatilty/reward'] = ((crypto_markets_df['gm_reward_per_100'] / crypto_markets_df['volatility_sum']).round(2)).astype(str)
+            
+            # Select the same columns as for other markets
+            crypto_markets_df = crypto_markets_df[['question', 'answer1', 'answer2', 'spread', 'rewards_daily_rate', 'gm_reward_per_100', 'sm_reward_per_100', 'bid_reward_per_100', 'ask_reward_per_100',  'volatility_sum', 'volatilty/reward', 'min_size', '1_hour', '3_hour', '6_hour', '12_hour', '24_hour', '7_day', '30_day',  
+                         'best_bid', 'best_ask', 'volatility_price', 'max_spread', 'tick_size',  
+                         'neg_risk',  'market_slug', 'token1', 'token2', 'condition_id']]
+            
+            print(f'{pd.to_datetime("now")}: Processed {len(crypto_markets_df)} crypto markets.')
+            
+            # Update the Crypto Markets worksheet
+            update_sheet(crypto_markets_df, wk_crypto)
+            print(f'{pd.to_datetime("now")}: Updated Crypto Markets worksheet.')
 
     print(f'{pd.to_datetime("now")}: Fetched select market of length {len(new_df)}.')
 

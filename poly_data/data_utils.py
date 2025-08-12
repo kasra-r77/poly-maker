@@ -1,6 +1,7 @@
 import poly_data.global_state as global_state
 from poly_data.utils import get_sheet_df
 import time
+import pandas as pd
 import poly_data.global_state as global_state
 
 #sth here seems to be removing the position
@@ -150,7 +151,19 @@ def update_markets():
 
     if len(received_df) > 0:
         global_state.df, global_state.params = received_df.copy(), received_params
-    
+    else:
+        print("Warning: Received empty DataFrame from get_sheet_df()")
+        # Initialize with empty DataFrame if not already set
+        if global_state.df is None:
+            global_state.df = pd.DataFrame()
+            global_state.params = {}
+        # Return early if there's no data to process
+        return
+
+    # Only proceed if we have data
+    if global_state.df is None or len(global_state.df) == 0:
+        print("Warning: No market data available in global_state.df")
+        return
 
     for _, row in global_state.df.iterrows():
         for col in ['token1', 'token2']:

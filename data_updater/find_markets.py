@@ -3,7 +3,9 @@ import numpy as np
 import os
 import requests
 import time
+import random
 import warnings
+from time import sleep
 warnings.filterwarnings("ignore")
 
 
@@ -22,28 +24,58 @@ def get_sel_df(spreadsheet, sheet_name='Selected Markets'):
 def get_all_markets(client):
     cursor = ""
     all_markets = []
+    page_count = 0
+
+    def fetch_markets(next_cursor):
+        # Add a small delay to avoid rate limiting
+        sleep(random.uniform(0.2, 0.5))
+        return client.get_sampling_markets(next_cursor=next_cursor)
 
     while True:
         try:
-            markets = client.get_sampling_markets(next_cursor = cursor)
+            # Use retry with backoff for API calls
+            markets = retry_with_backoff(fetch_markets, cursor)
             markets_df = pd.DataFrame(markets['data'])
 
+            # Preserve the raw market data for tag filtering
+            markets_df['raw_data'] = markets['data']
 
             cursor = markets['next_cursor']
             
-
-
             all_markets.append(markets_df)
+            page_count += 1
+            print(f"Fetched page {page_count} of markets")
 
             if cursor is None:
                 break
-        except:
+        except Exception as e:
+            print(f"Error fetching markets page: {e}")
             break
 
-    all_df = pd.concat(all_markets)
-    all_df = all_df.reset_index(drop=True)
+    if all_markets:
+        all_df = pd.concat(all_markets)
+        all_df = all_df.reset_index(drop=True)
+        return all_df
+    else:
+        return pd.DataFrame()
 
-    return all_df
+def filter_crypto_markets(all_df):
+    """
+    Filter markets that have crypto-related tags
+    """
+    crypto_markets = []
+    
+    for idx, row in all_df.iterrows():
+        if 'raw_data' in row and 'tags' in row['raw_data']:
+            tags = row['raw_data']['tags']
+            # Check if any crypto-related tag is present
+            if any(tag.lower() in ['crypto', 'bitcoin', 'ethereum', 'btc', 'eth', 'crypto prices'] for tag in tags):
+                crypto_markets.append(row)
+    
+    if crypto_markets:
+        return pd.DataFrame(crypto_markets)
+    else:
+        return pd.DataFrame()
 
 def get_bid_ask_range(ret, TICK_SIZE):
     bid_from = ret['midpoint'] - ret['max_spread'] / 100
@@ -112,7 +144,39 @@ def add_formula_params(curr_df, midpoint, v, daily_reward):
     curr_df['reward_per_100'] = (curr_df['Q'] / curr_df['Q'].sum()) * daily_reward / 2 / curr_df['size'] * curr_df['100']
     return curr_df
 
+def retry_with_backoff(func, *args, max_retries=5, base_delay=1, **kwargs):
+    """
+    Retry a function with exponential backoff
+    
+    Args:
+        func: The function to retry
+        *args: Arguments to pass to the function
+        max_retries: Maximum number of retries
+        base_delay: Base delay in seconds
+        **kwargs: Keyword arguments to pass to the function
+        
+    Returns:
+        The result of the function call
+    """
+    retries = 0
+    while True:
+        try:
+            return func(*args, **kwargs)
+        except Exception as e:
+            if "429" in str(e) and retries < max_retries:
+                # Rate limited, apply exponential backoff
+                sleep_time = base_delay * (2 ** retries) + random.uniform(0, 1)
+                print(f"Rate limited. Retrying in {sleep_time:.2f} seconds...")
+                sleep(sleep_time)
+                retries += 1
+            else:
+                # Not a rate limit error or max retries exceeded
+                raise
+
 def process_single_row(row, client):
+    # Add a small delay to avoid rate limiting
+    sleep(random.uniform(0.2, 0.5))
+    
     ret = {}
     ret['question'] = row['question']
     ret['neg_risk'] = row['neg_risk']
@@ -133,7 +197,13 @@ def process_single_row(row, client):
             break
 
     ret['rewards_daily_rate'] = rate
-    book = client.get_order_book(token1)
+    
+    # Use retry with backoff for API calls
+    try:
+        book = retry_with_backoff(client.get_order_book, token1)
+    except Exception as e:
+        print(f"Failed to get order book after retries: {e}")
+        raise
     
     bids = pd.DataFrame()
     asks = pd.DataFrame()
@@ -218,25 +288,40 @@ def process_single_row(row, client):
 
 def get_all_results(all_df, client, max_workers=5):
     all_results = []
+    error_log = []
 
     def process_with_progress(args):
         idx, row = args
         try:
-            return process_single_row(row, client)
-        except:
-            print("error fetching market")
-            return None
+            return process_single_row(row, client), None
+        except Exception as e:
+            market_info = {
+                'index': idx,
+                'question': row.get('question', 'Unknown'),
+                'market_slug': row.get('market_slug', 'Unknown'),
+                'error': str(e)
+            }
+            return None, market_info
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = [executor.submit(process_with_progress, (idx, row)) for idx, row in all_df.iterrows()]
         
         for future in concurrent.futures.as_completed(futures):
-            result = future.result()
+            result, error = future.result()
             if result is not None:
                 all_results.append(result)
+            if error is not None:
+                error_log.append(error)
+                print(f"Error fetching market: {error['question']} - {error['error']}")
 
             if len(all_results) % (max_workers * 2) == 0:
                 print(f'{len(all_results)} of {len(all_df)}')
+
+    # Save error log to file for later analysis
+    if error_log:
+        error_df = pd.DataFrame(error_log)
+        error_df.to_csv('market_errors.csv', index=False)
+        print(f"Saved {len(error_log)} market errors to market_errors.csv")
 
     return all_results
 
@@ -263,9 +348,35 @@ def calculate_annualized_volatility(df, hours):
     annualized_volatility = volatility * np.sqrt(60 * 24 * 252)
     return round(annualized_volatility, 2)
 
+def fetch_price_history(token_id):
+    """
+    Fetch price history with retry and backoff
+    """
+    url = f'https://clob.polymarket.com/prices-history?interval=1m&market={token_id}&fidelity=10'
+    
+    def _fetch():
+        response = requests.get(url)
+        if response.status_code == 429:
+            # Explicitly handle 429 status code
+            raise Exception(f"Rate limited (429) when fetching price history for {token_id}")
+        response.raise_for_status()
+        return response.json()
+    
+    # Add a small delay before making the request
+    sleep(random.uniform(0.2, 0.5))
+    
+    # Use retry with backoff
+    return retry_with_backoff(_fetch, max_retries=5, base_delay=2)
+
 def add_volatility(row):
-    res = requests.get(f'https://clob.polymarket.com/prices-history?interval=1m&market={row["token1"]}&fidelity=10')
-    price_df = pd.DataFrame(res.json()['history'])
+    # Fetch price history with retry and backoff
+    try:
+        history_data = fetch_price_history(row["token1"])
+        price_df = pd.DataFrame(history_data['history'])
+    except Exception as e:
+        print(f"Failed to fetch price history after retries: {e}")
+        raise
+    
     price_df['t'] = pd.to_datetime(price_df['t'], unit='s')
     price_df['p'] = price_df['p'].round(2)
 
@@ -293,27 +404,43 @@ def add_volatility(row):
 def add_volatility_to_df(df, max_workers=3):
     
     results = []
+    error_log = []
     df = df.reset_index(drop=True)
 
     def process_volatility_with_progress(args):
         idx, row = args
         try:
             ret = add_volatility(row.to_dict())
-            return ret
-        except:
-            print("Error fetching volatility")
-            return None
+            return ret, None
+        except Exception as e:
+            error_info = {
+                'index': idx,
+                'question': row.get('question', 'Unknown'),
+                'token1': row.get('token1', 'Unknown'),
+                'token2': row.get('token2', 'Unknown'),
+                'error': str(e)
+            }
+            return None, error_info
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = [executor.submit(process_volatility_with_progress, (idx, row)) for idx, row in df.iterrows()]
         
         for future in concurrent.futures.as_completed(futures):
-            result = future.result()
+            result, error = future.result()
             if result is not None:
                 results.append(result)
+            if error is not None:
+                error_log.append(error)
+                print(f"Error fetching volatility for {error['question']} (token: {error['token1']}): {error['error']}")
                 
             if len(results) % (max_workers * 2) == 0:
                 print(f'{len(results)} of {len(df)}')
+    
+    # Save error log to file for later analysis
+    if error_log:
+        error_df = pd.DataFrame(error_log)
+        error_df.to_csv('volatility_errors.csv', index=False)
+        print(f"Saved {len(error_log)} volatility errors to volatility_errors.csv")
             
     return pd.DataFrame(results)
 
